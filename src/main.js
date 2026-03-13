@@ -2121,52 +2121,33 @@ CCProgram fs %{
 	 * @param {string} dbUrl db:// 格式的资源路径
 	 * @returns {boolean} 如果发生了新目录创建，返回 true
 	 */
-	_ensureParentDirSync(dbUrl) {
-		const fspath = this._getFsPath(dbUrl);
-		if (!fspath) throw new Error(`无法解析路径: ${dbUrl}`);
-
-		const dir = require("path").dirname(fspath);
-		if (!fs.existsSync(dir)) {
-			fs.mkdirSync(dir, { recursive: true });
-			return true;
-		}
-		return false;
-	},
-
 	/**
-	 * 安全提取完整物理路径，绕过 assetdb 未注册时不返回的缺陷
-	 * @param {string} dbUrl
+	 * 安全访问父级目录 URL
+	 * @param {string} path db:// 资源路径
 	 */
-	_getFsPath(dbUrl) {
-		// Editor.assetdb.urlToFspath 只能解析 "已在数据库注册" 的路径！
-		// 对于深层且全新的 db://assets/foo/bar/test.txt，它返回 null！
-		let fspath = Editor.assetdb.urlToFspath(dbUrl);
-		if (fspath) return fspath;
-
-		// 手动解析 fallback
-		if (dbUrl.startsWith("db://assets/")) {
-			const relative = dbUrl.replace("db://assets/", "");
-			return require("path").join(Editor.Project.path, "assets", relative);
-		} else if (dbUrl.startsWith("db://internal/")) {
-			const relative = dbUrl.replace("db://internal/", "");
-			// internal mounting point: Editor.url('app://editor/static/default-assets')
-			return require("path").join(Editor.url("app://editor/static/default-assets"), relative);
+	_getDirUrl(path) {
+		const lastSlash = path.lastIndexOf("/");
+		if (lastSlash > 5) {
+			return path.substring(0, lastSlash);
 		}
-		return null;
+		return path;
 	},
 
 	/**
-	 * 安全创建资源，自动处理物理目录预创建、DB Watcher 隔离与父目录刷新 (V6 统一抽象方案)
+	 * 安全创建资源 (V7 终极纯原生异步方案)
+	 * 彻底放弃使用 fs.mkdirSync() 加上 refresh()，因为会和 OS 文件监视器产生必然的微秒级时序竞态 (导致严重的 uuid/path collision)。
+	 * 放弃对于纹理贴图使用 Editor.assetdb.create()，因为它原生存在导入期间向上查询不到自身 UUID 的崩溃 Bug。
+	 *
 	 * @param {string} path db:// 资源路径
 	 * @param {string|Buffer} content 文件内容
 	 * @param {Function} originalCallback 外层完毕回调 (err, msg)
-	 * @param {Function} [postCreateModifier] 在关闭 Watcher 的隔离区内执行的额外元数据修改回调
+	 * @param {Function} [postCreateModifier] 修改 Meta 的可选回调
 	 */
 	_safeCreateAsset(path, content, originalCallback, postCreateModifier = null) {
-		const fspath = this._getFsPath(path);
-		if (!fspath) {
-			return originalCallback(`无法手动解析文件系统路径: ${path}`);
-		}
+		const dirUrl = this._getDirUrl(path);
+		const fileName = path.substring(path.lastIndexOf("/") + 1);
+		const lowerName = fileName.toLowerCase();
+		const isTexture = lowerName.endsWith(".png") || lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg");
 
 		const doneCreate = (err, msg) => {
 			if (!Editor.App.focused) {
@@ -2176,39 +2157,63 @@ CCProgram fs %{
 			originalCallback(null, msg);
 		};
 
-		// 极其关键：必须在进行任何物理增删操作前暂停 Watcher，防止后台快照抢先处理刚建好的目录
+		// 提前加锁：屏蔽一切外界对于文件系统的后台骚扰，所有读写都在下面的 DB 队列里严格线性发生
 		Editor.AssetDB.runDBWatch("off");
 
-		let hasNewDir = false;
-		try {
-			hasNewDir = this._ensureParentDirSync(path);
-		} catch (e) {
-			return doneCreate(`创建物理目录失败: ${e.message}`);
-		}
+		// [步骤 1] 利用 Editor.assetdb.create 内部原生的 _ensureDirSync() 完美功能，
+		// 创一个占位空文件以强制让引擎自动原子化安全级联建出父文件夹、配套 .meta 以及注册映射！
+		const dummyPath = dirUrl + "/.dummy_mcp_" + Date.now() + ".txt";
 
-		try {
-			// 直接物理写入文件，绕过 Editor.assetdb.create 的内部设计缺陷
-			// (create API 会出现导入时父级 UUID 未能提前在内部映射中注册的问题)
-			fs.writeFileSync(fspath, content);
-		} catch (e) {
-			return doneCreate(`写入文件失败: ${e.message}`);
-		}
-
-		// 如果创建了新目录，我们直接刷新其父目录即可涵盖该文件，否则专门刷新文件本身
-		const refreshUrl = hasNewDir ? path.substring(0, path.lastIndexOf("/")) : path;
-
-		addLog("info", `[_safeCreateAsset] 触发目标 ${refreshUrl} 的刷新操作以补齐 Meta`);
-		Editor.assetdb.refresh(refreshUrl, (refreshErr) => {
-			if (refreshErr) {
-				addLog("warn", `[_safeCreateAsset] 刷新 ${refreshUrl} 失败: ${refreshErr}`);
-				return doneCreate(refreshErr);
+		Editor.assetdb.create(dummyPath, "dummy", (err) => {
+			if (err) {
+				return doneCreate(`级联建立父目录树失败: ${err.message || err}`);
 			}
 
-			if (postCreateModifier) {
-				postCreateModifier(doneCreate);
-			} else {
-				doneCreate(null, `资源已安全创建: ${path}`);
-			}
+			// [步骤 2] 父目录生态环境已完美确立在 DB 中，无需多言，删掉这个脚手架。
+			Editor.assetdb.delete([dummyPath], (delErr) => {
+				if (delErr) addLog("warn", "清理临时占位文件失败: " + delErr);
+
+				// [步骤 3] 正式创建目标
+				if (isTexture) {
+					// 贴图特例：为了避开 create() 处理图片 sub-assets 找不到自身的致命原生 Bug，
+					// 我们巧妙改用 import()！将 Buffer 写到真实系统的 tmp，由引擎从外部纯天然导进来！
+					const os = require("os");
+					const pathMod = require("path");
+					const fs = require("fs");
+
+					const tempOSPath = pathMod.join(os.tmpdir(), "mcp_" + Date.now() + "_" + fileName);
+					try {
+						fs.writeFileSync(tempOSPath, content);
+					} catch (e) {
+						return doneCreate(`写入 OS 临时贴图失败: ${e.message}`);
+					}
+
+					Editor.assetdb.import([tempOSPath], dirUrl, (impErr, results) => {
+						try {
+							fs.unlinkSync(tempOSPath);
+						} catch (e) {}
+
+						if (impErr) return doneCreate(`纹理导入操作失败: ${impErr.message || impErr}`);
+
+						if (postCreateModifier) {
+							postCreateModifier(doneCreate);
+						} else {
+							doneCreate(null, `资源已安全导入: ${path}`);
+						}
+					});
+				} else {
+					// 常规资产 (脚本、材质)：没有图片那种子节点切割的隐患，直接最顺滑的 native create
+					Editor.assetdb.create(path, content, (createErr) => {
+						if (createErr) return doneCreate(`资源常规创建失败: ${createErr.message || createErr}`);
+
+						if (postCreateModifier) {
+							postCreateModifier(doneCreate);
+						} else {
+							doneCreate(null, `资源已创建: ${path}`);
+						}
+					});
+				}
+			});
 		});
 	},
 
